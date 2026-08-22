@@ -199,7 +199,43 @@ def send_alert(text):
         except Exception as exc:
             print(f"تعذر إرسال التنبيه إلى {target}: {exc}")
 
+@bot.message_handler(commands=["check"])
+def check_event(message):
+    if not is_admin(message.from_user.id):
+        bot.reply_to(message, "هذا الأمر مخصص للإدارة.")
+        return
 
+    from webook_monitor import fetch_event
+
+    events = subscribers.list_watches()
+
+    if not events:
+        bot.reply_to(message, "لا توجد فعاليات تحت المراقبة.")
+        return
+
+    event_id, url, label = events[0]
+
+    try:
+        data, fingerprint = fetch_event(url)
+
+        remaining = data.get("remaining_public")
+        remaining_text = str(remaining) if remaining is not None else "غير معلن"
+
+        bot.send_message(
+            message.chat.id,
+            "✅ تم فحص Webook الآن\n\n"
+            f"🎟️ الفعالية: {data.get('title') or 'غير معلن'}\n"
+            f"📅 الموعد: {data.get('start_date') or 'غير معلن'}\n"
+            f"📍 المكان: {data.get('location') or 'غير معلن'}\n"
+            f"💰 السعر: {data.get('price') or 'غير معلن'}\n"
+            f"🟢 التوفر: {data.get('availability') or 'غير معلن'}\n"
+            f"🎫 المتبقي المعلن: {remaining_text}\n\n"
+            f"🔗 {url}",
+            disable_web_page_preview=True
+        )
+
+    except Exception as exc:
+        bot.reply_to(message, f"❌ فشل فحص Webook:\n{exc}")
 if __name__ == "__main__":
     print("✅ تم تشغيل بوت التذاكر")
     print(f"🤖 البوت: @{bot.get_me().username}")
