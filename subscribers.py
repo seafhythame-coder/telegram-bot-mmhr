@@ -1,130 +1,263 @@
 import os
-import json
-import time
-import random
-import threading
-from datetime import datetime
-import urllib.request
 
-DB_PATH = 'db_store.json'
-cart_lock = threading.Lock()  # قفل الدرع الحديدي لحماية التذاكر من المنافسين
+import psycopg
+from psycopg.types.json import Jsonb
+from dotenv import load_dotenv
 
-# قاعدة الأزرار الخارجية والتصنيفات مدمجة تلقائياً
+load_dotenv()
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+
 CATEGORIES = {
-    'concerts': '🎵 حفلات موسيقية (صفوف أمامية)',
-    'sports': '⚽ فعاليات رياضية ومباريات كبرى',
-    'theaters': '🎭 مسرحيات وعروض حصرية',
-    'dining': '🍽️ تجارب طعام VIP',
-    'activities': '🎪 أنشطة وفعاليات جماعية'
+    "concerts": "🎵 حفلات موسيقية",
+    "sports": "⚽ مباريات وفعاليات رياضية",
+    "theaters": "🎭 مسرح وعروض",
+    "dining": "🍽️ تجارب طعام",
+    "activities": "🎪 أنشطة وفعاليات",
 }
 
-# قائمة الكلمات المفتاحية للبحث الآلي والرادار
-TARGET_KEYWORDS = ["محمد عبده", "تامر", "أنغام", "عايض", "مباراة", "الهلال", "النصر"]
 
-def read_db():
-    if not os.path.exists(DB_PATH):
-        with open(DB_PATH, 'w', encoding='utf-8') as f:
-            json.dump({"users": {}, "tracked_events": {}}, f, ensure_ascii=False, indent=2)
-    try:
-        with open(DB_PATH, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except:
-        return {"users": {}, "tracked_events": {}}
+def get_connection():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL غير موجود في .env")
 
-def write_db(data):
-    with open(DB_PATH, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    return psycopg.connect(DATABASE_URL)
+
+
+def init_db():
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS subscribers (
+                    user_id BIGINT PRIMARY KEY,
+                    registered_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS subscriber_categories (
+                    user_id BIGINT NOT NULL
+                        REFERENCES subscribers(user_id)
+                        ON DELETE CASCADE,
+                    section_key TEXT NOT NULL,
+                    PRIMARY KEY (user_id, section_key)
+                )
+            """)
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS watched_events (
+                    id SERIAL PRIMARY KEY,
+                    url TEXT UNIQUE NOT NULL,
+                    label TEXT,
+                    active BOOLEAN DEFAULT TRUE,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS event_snapshots (
+                    id BIGSERIAL PRIMARY KEY,
+                    event_id INTEGER NOT NULL
+                        REFERENCES watched_events(id)
+                        ON DELETE CASCADE,
+                    captured_at TIMESTAMPTZ DEFAULT NOW(),
+                    fingerprint TEXT NOT NULL,
+                    data JSONB NOT NULL
+                )
+            """)
+
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_event_snapshots_event
+                ON event_snapshots(event_id, captured_at DESC)
+            """)
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS guest_requests (
+                    id BIGSERIAL PRIMARY KEY,
+                    user_id BIGINT,
+                    guest_name TEXT,
+                    hotel TEXT,
+                    event_name TEXT NOT NULL,
+                    quantity INTEGER NOT NULL,
+                    category TEXT,
+                    status TEXT DEFAULT 'new',
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+
 
 def add_subscriber(user_id):
-    db = read_db()
-    if str(user_id) not in db["users"]:
-        db["users"][str(user_id)] = {"active_categories": [], "registered_at": datetime.now().isoformat()}
-        write_db(db)
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO subscribers (user_id)
+                VALUES (%s)
+                ON CONFLICT (user_id) DO NOTHING
+            """, (user_id,))
+
 
 def get_user_categories(user_id):
-    db = read_db()
-    return db["users"].get(str(user_id), {}).get("active_categories", [])
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT section_key
+                FROM subscriber_categories
+                WHERE user_id = %s
+            """, (user_id,))
+
+            return [row[0] for row in cur.fetchall()]
+
 
 def toggle_category(user_id, section_key):
-    db = read_db()
-    uid = str(user_id)
-    if uid in db["users"]:
-        active = db["users"][uid]["active_categories"]
-        if section_key in active:
-            active.remove(section_key)
-        else:
-            active.append(section_key)
-        write_db(db)
+    if section_key not in CATEGORIES:
+        return
 
-# 🔬 [حماية الزئبق] إخفاء الهوية والتمويه لتوليد بصمات أجهزة مختلفة
-def get_stealth_headers():
-    user_agents = [
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36"
-    ]
-    headers = {
-        'User-Agent': random.choice(user_agents),
-        'Accept': 'application/json, text/plain, */*',
-        'Accept-Language': 'ar-SA,ar;q=0.9,en-US;q=0.8',
-        'X-Forwarded-For': f"{random.randint(5,230)}.{random.randint(10,240)}.{random.randint(1,254)}.{random.randint(1,254)}"
-    }
-    return headers
+    add_subscriber(user_id)
 
-# 🔒 [بروتوكول 101.1 المصرفي المحاكي] (ISO 8583 المعاملات الفورية)
-def process_pos_payment_101_1(card_number, expiry, amount):
-    try:
-        print(f"🔒 [ISO 8583] تشفير الحقول المالية للبطاقة... معيار 101.1 مفعل.")
-        field_4_amount = f"{int(amount * 100):012d}"
-        field_11_stan = f"{int(time.time()) % 1000000:06d}"
-        
-        time.sleep(0.2) # سرعة معالجة الشبكة المصرفية المحاكية (200 ملي ثانية)
-        approval_code = "00" # رمز الموافقة البنكي الدولي
-        
-        if approval_code == "00":
-            print(f"✅ [Approval STAN: {field_11_stan}] تم السداد الفوري وتثبيت التذكرة بنجاح.")
-            return True, field_11_stan
-        return False, "Decline"
-    except Exception as e:
-        print(f"❌ فشل اتصال البروتوكول المصرفي: {e}")
-        return False, str(e)
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT 1
+                FROM subscriber_categories
+                WHERE user_id = %s
+                  AND section_key = %s
+            """, (user_id, section_key))
 
-# 🔎 [رادار الاستكشاف التلقائي] للبحث عن الحفلات والمباريات القادمة فور إدراجها
-def auto_discover_events(bot_instance=None, channel_id=None):
-    print("🔎 [رادار الاستكشاف] مسح خوادم المنصة للبحث عن أي حفلات أو مباريات جديدة...")
-    db = read_db()
-    main_url = "https://webook.com"
-    
-    try:
-        req = urllib.request.Request(main_url, headers=get_stealth_headers())
-        with urllib.request.urlopen(req, timeout=10) as response:
-            html_content = response.read().decode('utf-8')
-            
-            for keyword in TARGET_KEYWORDS:
-                if keyword in html_content and keyword not in db["tracked_events"]:
-                    print(f"🎉 [حدث مكتشف تلقائياً]! تم رصد فعالية جديدة تخص [{keyword}]")
-                    
-                    db["tracked_events"][keyword] = {
-                        "status": "SOON",
-                        "status_text": "⏳ تم رصد الفعالية تلقائياً (بانتظار نزول الدفعات)",
-                        "price": "375 ريال",
-                        "checked_at": datetime.now().strftime("%H:%M:%S")
-                    }
-                    write_db(db)
-                    
-                    if bot_instance and channel_id:
-                        msg = (
-                            f"🔔 *تم رصد فعالية جديدة تلقائياً في النظام!*\n\n"
-                            f"📌 *الحدث:* حفلة / مباراة تخص [{keyword}]\n"
-                            f"📊 *الحالة:* مضافة لغرفة الرصد والمراقبة المستمرة (قبل الطرح) ⏳\n\n"
-                            f"⚡ المنظومة تتابع الخريطة الآن بانتظار نزول الدفعات الكبرى لتجميدها."
-                        )
-                        bot_instance.send_message(channel_id, msg, parse_mode='Markdown')
-    except Exception as e:
-        print(f"⚠️ تنبيه الرادار: تعذر مسح المنصة حالياً، سيتم الإعادة تلقائياً.")
+            if cur.fetchone():
+                cur.execute("""
+                    DELETE FROM subscriber_categories
+                    WHERE user_id = %s
+                      AND section_key = %s
+                """, (user_id, section_key))
+            else:
+                cur.execute("""
+                    INSERT INTO subscriber_categories
+                    (user_id, section_key)
+                    VALUES (%s, %s)
+                """, (user_id, section_key))
 
-# 🔄 [محرك تجميد السلة والدرع الحديدي] (Cart Rolling Engine) واقتناص الخريطة
-def run_cart_rolling_engine():
-    global cart_lock
-    print("⚡ [Turbo Stream] المحرك يحلل الآن ملفات الـ JSON المخفية لخريطة المقاعد...")
-    return True
+
+def add_watch(url, label=None):
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO watched_events (url, label)
+                VALUES (%s, %s)
+                ON CONFLICT (url)
+                DO UPDATE SET
+                    active = TRUE,
+                    label = COALESCE(
+                        EXCLUDED.label,
+                        watched_events.label
+                    )
+                RETURNING id
+            """, (url, label))
+
+            return cur.fetchone()[0]
+
+
+def list_watches():
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, url, label
+                FROM watched_events
+                WHERE active = TRUE
+                ORDER BY id
+            """)
+
+            return cur.fetchall()
+
+
+def get_last_snapshot(event_id):
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT fingerprint, data
+                FROM event_snapshots
+                WHERE event_id = %s
+                ORDER BY captured_at DESC
+                LIMIT 1
+            """, (event_id,))
+
+            row = cur.fetchone()
+
+            if not row:
+                return None
+
+            return {
+                "fingerprint": row[0],
+                "data": row[1],
+            }
+
+
+def save_snapshot(event_id, fingerprint, data):
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO event_snapshots
+                (event_id, fingerprint, data)
+                VALUES (%s, %s, %s)
+            """, (
+                event_id,
+                fingerprint,
+                Jsonb(data),
+            ))
+
+
+def add_guest_request(
+    user_id,
+    guest_name,
+    hotel,
+    event_name,
+    quantity,
+    category
+):
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO guest_requests
+                (
+                    user_id,
+                    guest_name,
+                    hotel,
+                    event_name,
+                    quantity,
+                    category
+                )
+                VALUES (%s, %s, %s, %s, %s, %s)
+                RETURNING id
+            """, (
+                user_id,
+                guest_name,
+                hotel,
+                event_name,
+                quantity,
+                category,
+            ))
+
+            return cur.fetchone()[0]
+
+
+def list_guest_requests(limit=20):
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    id,
+                    guest_name,
+                    hotel,
+                    event_name,
+                    quantity,
+                    category,
+                    status,
+                    created_at
+                FROM guest_requests
+                ORDER BY created_at DESC
+                LIMIT %s
+            """, (limit,))
+
+            return cur.fetchall()
+
+
+init_db()
